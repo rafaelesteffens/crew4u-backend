@@ -28,7 +28,7 @@ app.add_middleware(
 def health_check():
     return {
         "status": "ok",
-        "message": "CrewPay backend funcionando",
+        "message": "Crew 4U backend funcionando",
     }
 
 
