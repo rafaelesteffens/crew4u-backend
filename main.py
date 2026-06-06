@@ -7,6 +7,7 @@ import os
 import re
 import csv
 import math
+import calendar
 import traceback
 
 app = FastAPI()
@@ -213,25 +214,37 @@ def extrair_linhas_brutas(sheet):
 def detectar_periodo_vigencia(sheet):
     limite_linhas = min(sheet.max_row, 15)
     limite_colunas = min(sheet.max_column, 25)
+
     for row in sheet.iter_rows(min_row=1, max_row=limite_linhas, min_col=1, max_col=limite_colunas, values_only=True):
         for cell in row:
-            texto = converter_valor_para_texto(cell)
-            periodo = tentar_extrair_periodo_do_texto(texto)
+            periodo = tentar_extrair_periodo_do_texto(converter_valor_para_texto(cell))
             if periodo:
                 return periodo
-    # fallback: usar menor/maior data encontrada nas primeiras colunas
-    datas = []
-    for row in sheet.iter_rows(values_only=True):
-        for cell in list(row)[:6]:
-            d = converter_para_data(cell)
-            if d:
-                datas.append(d)
-    if datas:
-        inicio = min(datas)
-        fim = max(datas)
-        return {"inicio": inicio, "fim": fim}
-    return None
 
+    # Fallback: algumas escalas não trazem o período no cabeçalho do mesmo jeito.
+    # Neste caso, inferimos o mês mais frequente a partir das datas encontradas nas linhas.
+    datas = []
+    for row in sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 250), min_col=1, max_col=min(sheet.max_column, 12), values_only=True):
+        for cell in row:
+            data_lida = converter_para_data(cell)
+            if data_lida:
+                datas.append(data_lida)
+
+    if not datas:
+        return None
+
+    contagem = {}
+    for d in datas:
+        chave = (d.year, d.month)
+        contagem[chave] = contagem.get(chave, 0) + 1
+
+    ano, mes = sorted(contagem.items(), key=lambda item: item[1], reverse=True)[0][0]
+    ultimo_dia = calendar.monthrange(ano, mes)[1]
+
+    return {
+        "inicio": date(ano, mes, 1),
+        "fim": date(ano, mes, ultimo_dia),
+    }
 
 def tentar_extrair_periodo_do_texto(texto):
     if not texto:
@@ -280,6 +293,13 @@ def extrair_eventos_escala(sheet, periodo, aeroportos):
 
         if not texto_linha:
             continue
+
+        # A escala LATAM traz uma seção LEGEND no rodapé.
+        # Depois dela aparecem ASB/HSB/DO como explicação, não como atividade real.
+        # Se não pararmos aqui, o parser cria atividades falsas no último dia lido.
+        if eh_inicio_secao_legenda(texto_linha):
+            break
+
         if eh_linha_cabecalho(texto_linha):
             continue
 
@@ -368,6 +388,11 @@ def extrair_eventos_escala(sheet, periodo, aeroportos):
             continue
 
         if servico:
+            # Evita transformar linhas explicativas/legenda em eventos falsos.
+            # Serviço real precisa ter pelo menos origem/horário ou duty report/debrief.
+            if not dep and not arr and not duty_report_texto and not duty_debrief_texto:
+                continue
+
             # Reserva/Sobreaviso podem vir com origem/horário; se não vier, ainda enviamos para aparecer na escala.
             duty_report_evento, duty_debrief_evento = consumir_duty(jornada_atual, duty_debrief_texto)
             origem = dep["aeroporto"] if dep else ""
@@ -399,10 +424,15 @@ def extrair_eventos_escala(sheet, periodo, aeroportos):
             continue
 
     eventos = ordenar_eventos(eventos)
-    eventos = remover_folgas_em_dias_com_atividade(eventos)
     eventos = deduplicar_eventos_escala(eventos)
+
+    if periodo is None:
+        periodo = inferir_periodo_por_eventos(eventos)
+
+    # Mantém as folgas reais do Excel e também preenche dias sem nenhuma atividade.
+    # A seção LEGEND/LEGENDA já é cortada antes de virar evento, então não precisamos
+    # apagar folgas depois: isso evita sumir DO real.
     eventos = preencher_folgas_dias_sem_evento(eventos, periodo)
-    eventos = remover_folgas_em_dias_com_atividade(eventos)
     eventos = deduplicar_eventos_escala(eventos)
     return ordenar_eventos(eventos)
 
@@ -424,6 +454,28 @@ def eh_linha_cabecalho(texto_linha):
     tem_evento = bool(extrair_codigo_voo(texto_linha) or re.search(r"\b(ASB\d*|HSB|HSBI|HSBE|DO|OFF)\b", texto_linha))
     return any(c in texto_linha for c in cabecalhos) and not tem_evento
 
+
+def eh_inicio_secao_legenda(texto_linha):
+    texto = f" {texto_linha.upper().strip()} "
+
+    # A seção de legenda costuma começar explicitamente com LEGEND/LEGENDA.
+    # Não podemos parar a leitura só porque apareceu "DAY OFF", porque isso
+    # também pode existir em uma folga real da escala.
+    if re.search(r"\bLEGEND\b", texto) or re.search(r"\bLEGENDA\b", texto):
+        return True
+
+    # Fallback para arquivos sem a palavra LEGEND, mas com linhas puramente
+    # explicativas no rodapé.
+    texto_limpo = re.sub(r"\s+", " ", texto).strip()
+    explicacoes = [
+        "ASB AIRPORT STAND BY",
+        "HSB HOME STAND BY",
+        "HSBI HOME STAND BY",
+        "HSBE HOME STAND BY",
+        "DO DAY OFF",
+        "OFF DAY OFF",
+    ]
+    return texto_limpo in explicacoes
 
 def procurar_data_na_linha(cells):
     for cell in list(cells)[:8]:
@@ -513,6 +565,30 @@ def ordenar_eventos(eventos):
         ordem_tipo = 9 if event.get("tipo") == "FOLGA" else 1
         return (dt, ordem_tipo)
     return sorted(eventos, key=chave)
+
+
+def inferir_periodo_por_eventos(eventos):
+    datas = []
+    for event in eventos:
+        d = converter_para_data(event.get("data_iso")) or converter_para_data(event.get("data"))
+        if d:
+            datas.append(d)
+
+    if not datas:
+        return None
+
+    contagem = {}
+    for d in datas:
+        chave = (d.year, d.month)
+        contagem[chave] = contagem.get(chave, 0) + 1
+
+    ano, mes = sorted(contagem.items(), key=lambda item: item[1], reverse=True)[0][0]
+    ultimo_dia = calendar.monthrange(ano, mes)[1]
+
+    return {
+        "inicio": date(ano, mes, 1),
+        "fim": date(ano, mes, ultimo_dia),
+    }
 
 
 def preencher_folgas_dias_sem_evento(eventos, periodo):
