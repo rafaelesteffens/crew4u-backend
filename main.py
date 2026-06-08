@@ -545,6 +545,30 @@ def criar_evento_folga(data_atual, codigo, pairing_atual, dep, arr):
     }
 
 
+def criar_evento_descanso_fora_base(data_atual, aeroporto):
+    return {
+        "data": data_atual.strftime("%d/%m/%Y"),
+        "data_iso": data_atual.strftime("%Y-%m-%d"),
+        "tipo": "DESCANSO",
+        "identificacao": "Descanso",
+        "pairing": "FORA_BASE",
+        "origem": aeroporto or "",
+        "saida": "",
+        "destino": aeroporto or "",
+        "chegada": "",
+        "duty_report": "",
+        "duty_debrief": "",
+        "duracao_horas": 0,
+        "distancia_km": 0,
+        "km_diurno": 0,
+        "km_noturno": 0,
+        "km_fim_semana": 0,
+        "km_fim_semana_noturno": 0,
+        "status": "OK",
+        "cafe": "", "almoco": "", "jantar": "", "ceia": "", "grupo_diaria": "", "moeda_diaria": "",
+    }
+
+
 def consumir_duty(jornada_atual, duty_debrief_texto):
     duty_report_evento = ""
     duty_debrief_evento = ""
@@ -600,7 +624,9 @@ def preencher_folgas_dias_sem_evento(eventos, periodo):
         return eventos
 
     # Só cria folga automática quando o dia não possui nenhum evento real.
-    # Isso evita o xabu de aparecer DO/OFF no mesmo dia de HSB/ASB/voo.
+    # Se o tripulante está pernoitando fora da base entre dois voos, o dia vira
+    # descanso fora da base, não FOLGA/DO. Isso evita contar "folga" em aeroporto
+    # onde a pessoa acabou de pousar e ainda precisa sair de lá.
     datas_com_evento = {e.get("data_iso") for e in eventos if e.get("data_iso")}
     novos = list(eventos)
     cursor = periodo["inicio"]
@@ -608,10 +634,43 @@ def preencher_folgas_dias_sem_evento(eventos, periodo):
     while cursor <= periodo["fim"]:
         iso = cursor.strftime("%Y-%m-%d")
         if iso not in datas_com_evento:
-            novos.append(criar_evento_folga(cursor, "DO", "DO", None, None))
+            aeroporto_descanso = aeroporto_descanso_fora_base(eventos, cursor)
+            if aeroporto_descanso:
+                novos.append(criar_evento_descanso_fora_base(cursor, aeroporto_descanso))
+            else:
+                novos.append(criar_evento_folga(cursor, "DO", "DO", None, None))
         cursor += timedelta(days=1)
 
     return ordenar_eventos(novos)
+
+
+def aeroporto_descanso_fora_base(eventos, data_atual):
+    base = "GRU"
+    anteriores = []
+    posteriores = []
+
+    for evento in eventos:
+        if evento.get("tipo") == "FOLGA":
+            continue
+        data_evento = converter_para_data(evento.get("data_iso"))
+        if data_evento is None:
+            continue
+        if data_evento < data_atual:
+            anteriores.append(evento)
+        elif data_evento > data_atual:
+            posteriores.append(evento)
+
+    if not anteriores or not posteriores:
+        return ""
+
+    anterior = ordenar_eventos(anteriores)[-1]
+    proximo = ordenar_eventos(posteriores)[0]
+    aeroporto_anterior = limpar_texto(anterior.get("destino") or anterior.get("origem"))
+    aeroporto_proximo = limpar_texto(proximo.get("origem") or proximo.get("destino"))
+
+    if aeroporto_anterior and aeroporto_anterior == aeroporto_proximo and aeroporto_anterior != base:
+        return aeroporto_anterior
+    return ""
 
 
 def remover_folgas_em_dias_com_atividade(eventos):
