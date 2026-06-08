@@ -364,9 +364,11 @@ def extrair_eventos_escala(sheet, periodo, aeroportos):
             duty_report_evento, duty_debrief_evento = consumir_duty(jornada_atual, duty_debrief_texto)
             distancia_km = calcular_distancia_rota(dep["aeroporto"], arr["aeroporto"], aeroportos)
             km_periodos = dividir_km_por_periodo(data_atual, dep["hora"], arr["hora"], distancia_km)
+            fim_evento = fim_evento_datetime(data_atual, dep["hora"], arr["hora"])
             eventos.append({
                 "data": data_atual.strftime("%d/%m/%Y"),
                 "data_iso": data_atual.strftime("%Y-%m-%d"),
+                "data_fim_iso": fim_evento.date().strftime("%Y-%m-%d") if fim_evento else data_atual.strftime("%Y-%m-%d"),
                 "tipo": "VOO",
                 "identificacao": voo,
                 "pairing": jornada_atual.get("pairing", pairing_atual),
@@ -404,9 +406,11 @@ def extrair_eventos_escala(sheet, periodo, aeroportos):
             saida = dep["hora"] if dep else duty_report_evento
             chegada = arr["hora"] if arr else duty_debrief_evento
             duracao = calcular_duracao_horas(data_atual, saida, chegada) if saida and chegada else 0
+            fim_evento = fim_evento_datetime(data_atual, saida, chegada)
             eventos.append({
                 "data": data_atual.strftime("%d/%m/%Y"),
                 "data_iso": data_atual.strftime("%Y-%m-%d"),
+                "data_fim_iso": fim_evento.date().strftime("%Y-%m-%d") if fim_evento else data_atual.strftime("%Y-%m-%d"),
                 "tipo": servico["tipo"],
                 "identificacao": servico["codigo"],
                 "pairing": jornada_atual.get("pairing", pairing_atual),
@@ -437,6 +441,7 @@ def extrair_eventos_escala(sheet, periodo, aeroportos):
     # A seção LEGEND/LEGENDA já é cortada antes de virar evento, então não precisamos
     # apagar folgas depois: isso evita sumir DO real.
     eventos = preencher_folgas_dias_sem_evento(eventos, periodo)
+    eventos = remover_folgas_em_dias_com_atividade(eventos)
     eventos = deduplicar_eventos_escala(eventos)
     return ordenar_eventos(eventos)
 
@@ -525,6 +530,7 @@ def criar_evento_folga(data_atual, codigo, pairing_atual, dep, arr):
     return {
         "data": data_atual.strftime("%d/%m/%Y"),
         "data_iso": data_atual.strftime("%Y-%m-%d"),
+        "data_fim_iso": data_atual.strftime("%Y-%m-%d"),
         "tipo": "FOLGA",
         "identificacao": codigo or "DO",
         "pairing": pairing_atual or codigo or "DO",
@@ -549,6 +555,7 @@ def criar_evento_descanso_fora_base(data_atual, aeroporto):
     return {
         "data": data_atual.strftime("%d/%m/%Y"),
         "data_iso": data_atual.strftime("%Y-%m-%d"),
+        "data_fim_iso": data_atual.strftime("%Y-%m-%d"),
         "tipo": "DESCANSO",
         "identificacao": "Descanso",
         "pairing": "FORA_BASE",
@@ -627,7 +634,7 @@ def preencher_folgas_dias_sem_evento(eventos, periodo):
     # Se o tripulante está pernoitando fora da base entre dois voos, o dia vira
     # descanso fora da base, não FOLGA/DO. Isso evita contar "folga" em aeroporto
     # onde a pessoa acabou de pousar e ainda precisa sair de lá.
-    datas_com_evento = {e.get("data_iso") for e in eventos if e.get("data_iso")}
+    datas_com_evento = datas_ocupadas_por_eventos(eventos)
     novos = list(eventos)
     cursor = periodo["inicio"]
 
@@ -673,6 +680,37 @@ def aeroporto_descanso_fora_base(eventos, data_atual):
     return ""
 
 
+def datas_ocupadas_por_eventos(eventos):
+    datas = set()
+    for evento in eventos:
+        if evento.get("tipo") == "FOLGA":
+            continue
+        for data_ocupada in datas_ocupadas_evento(evento):
+            datas.add(data_ocupada.strftime("%Y-%m-%d"))
+    return datas
+
+
+def datas_ocupadas_evento(evento):
+    data_inicio = converter_para_data(evento.get("data_iso") or evento.get("data"))
+    if data_inicio is None:
+        return []
+
+    data_fim = converter_para_data(evento.get("data_fim_iso"))
+    if data_fim is None:
+        fim = fim_evento_datetime(data_inicio, evento.get("saida"), evento.get("chegada"))
+        data_fim = fim.date() if fim else data_inicio
+
+    if data_fim < data_inicio:
+        data_fim = data_inicio
+
+    resultado = []
+    cursor = data_inicio
+    while cursor <= data_fim:
+        resultado.append(cursor)
+        cursor += timedelta(days=1)
+    return resultado
+
+
 def remover_folgas_em_dias_com_atividade(eventos):
     """Remove DO/OFF de dias que já possuem atividade real.
 
@@ -680,11 +718,7 @@ def remover_folgas_em_dias_com_atividade(eventos):
     outras atividades. Para a visualização principal, folga só deve aparecer em
     dia realmente livre.
     """
-    datas_com_atividade = {
-        e.get("data_iso")
-        for e in eventos
-        if e.get("data_iso") and e.get("tipo") != "FOLGA"
-    }
+    datas_com_atividade = datas_ocupadas_por_eventos(eventos)
 
     return [
         e for e in eventos
@@ -1267,11 +1301,21 @@ def calcular_duracao_horas(data_base, hora_inicio, hora_fim):
     if not hora_inicio or not hora_fim:
         return 0.0
     inicio = criar_datetime(data_base, hora_inicio)
+    fim = fim_evento_datetime(data_base, hora_inicio, hora_fim)
+    if fim is None:
+        return 0.0
+    duracao = (fim - inicio).total_seconds() / 3600
+    return arredondar_2(duracao)
+
+
+def fim_evento_datetime(data_base, hora_inicio, hora_fim):
+    if not data_base or not hora_inicio or not hora_fim:
+        return None
+    inicio = criar_datetime(data_base, hora_inicio)
     fim = criar_datetime(data_base, hora_fim)
     if fim <= inicio:
         fim += timedelta(days=1)
-    duracao = (fim - inicio).total_seconds() / 3600
-    return arredondar_2(duracao)
+    return fim
 
 
 def criar_datetime(data_base, hora_texto):
