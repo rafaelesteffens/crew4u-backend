@@ -371,8 +371,12 @@ def extrair_eventos_escala(sheet, periodo, aeroportos):
                 "identificacao": voo,
                 "pairing": jornada_atual.get("pairing", pairing_atual),
                 "origem": dep["aeroporto"],
+                "origem_lat": coordenada_aeroporto(aeroportos, dep["aeroporto"], "lat"),
+                "origem_lon": coordenada_aeroporto(aeroportos, dep["aeroporto"], "lon"),
                 "saida": dep["hora"],
                 "destino": arr["aeroporto"],
+                "destino_lat": coordenada_aeroporto(aeroportos, arr["aeroporto"], "lat"),
+                "destino_lon": coordenada_aeroporto(aeroportos, arr["aeroporto"], "lon"),
                 "chegada": arr["hora"],
                 "duty_report": duty_report_evento,
                 "duty_debrief": duty_debrief_evento,
@@ -1029,6 +1033,14 @@ def calcular_distancia_rota(origem, destino, aeroportos):
     a = aeroportos[origem]
     b = aeroportos[destino]
     return haversine_km(a["lat"], a["lon"], b["lat"], b["lon"])
+
+
+def coordenada_aeroporto(aeroportos, codigo, campo):
+    aeroporto = aeroportos.get(str(codigo).strip().upper())
+    if not aeroporto:
+        return ""
+    valor = aeroporto.get(campo, "")
+    return "" if valor is None else valor
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
